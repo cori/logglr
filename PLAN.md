@@ -79,16 +79,22 @@ struct LogData: Codable {
     var text: String?
     var metric: Metric?
     var location: Location?
-    var imageURL: URL?
     var tags: [String]?
-    var extra: [String: AnyCodable]?  // Extensible payload
+    // Note: imageURL and extra fields deferred to post-MVP
 }
 
 struct Metric: Codable {
     let name: String              // "mood", "energy", "focus", "pain"
     let value: Double             // Numeric value
     var unit: String?             // Optional unit label
-    var scale: ClosedRange<Double>?  // e.g., 1...10
+    var scaleMin: Double?         // e.g., 1
+    var scaleMax: Double?         // e.g., 10
+
+    enum CodingKeys: String, CodingKey {
+        case name, value, unit
+        case scaleMin = "scale_min"
+        case scaleMax = "scale_max"
+    }
 }
 
 struct Location: Codable {
@@ -101,7 +107,7 @@ struct Location: Codable {
 ```
 
 ```typescript
-// TypeScript (API)
+// TypeScript (API) - MVP version
 interface LogEntry {
   id: string;                     // UUID
   timestamp: string;              // ISO 8601
@@ -125,9 +131,8 @@ interface LogEntry {
       altitude?: number;
       place_name?: string;
     };
-    image_url?: string;
     tags?: string[];
-    [key: string]: unknown;       // Extensible
+    // Note: image_url and extensible fields deferred to post-MVP
   };
 }
 ```
@@ -579,72 +584,78 @@ struct QuickLogView: View {
             timestamp: Date(),
             recordedAt: Date(),
             source: "watch",
-            deviceId: WKInterfaceDevice.current().identifierForVendor?.uuidString ?? "unknown",
+            deviceId: DeviceInfo.identifier,
             category: "mood",
             data: LogData(
-                metric: Metric(name: "mood", value: moodValue),
+                text: "Energy: \(Int(energyValue))",  // MVP: store energy in text
+                metric: Metric(
+                    name: "mood",
+                    value: moodValue,
+                    scaleMin: 1,
+                    scaleMax: 10
+                ),
                 tags: ["quick-log"]
             )
         )
-        
-        // Also log energy as separate metric in same entry or separate?
-        // For now, add to extra data
-        entry.data.extra = ["energy": energyValue]
-        
+
         modelContext.insert(entry)
-        
+
         showingConfirmation = true
-        
+
         // Trigger sync via Watch Connectivity
         WatchSessionManager.shared.requestSync()
     }
 }
 ```
 
-#### ComplicationController.swift
+#### QuickLogWidget.swift (WidgetKit Complication)
 
 ```swift
-import ClockKit
+import WidgetKit
 import SwiftUI
 
-class ComplicationController: NSObject, CLKComplicationDataSource {
-    
-    func complicationDescriptors() async -> [CLKComplicationDescriptor] {
-        [
-            CLKComplicationDescriptor(
-                identifier: "quickLog",
-                displayName: "Quick Log",
-                supportedFamilies: [.graphicCircular, .graphicCorner, .modularSmall]
-            )
-        ]
-    }
-    
-    func currentTimelineEntry(for complication: CLKComplication) async -> CLKComplicationTimelineEntry? {
-        let template = makeTemplate(for: complication.family)
-        return CLKComplicationTimelineEntry(date: Date(), complicationTemplate: template)
-    }
-    
-    private func makeTemplate(for family: CLKComplicationFamily) -> CLKComplicationTemplate {
-        switch family {
-        case .graphicCircular:
-            return CLKComplicationTemplateGraphicCircularView(
-                ComplicationCircularView()
-            )
-        default:
-            return CLKComplicationTemplateGraphicCircularView(
-                ComplicationCircularView()
-            )
+struct QuickLogWidget: Widget {
+    let kind: String = "QuickLogWidget"
+
+    var body: some WidgetConfiguration {
+        StaticConfiguration(kind: kind, provider: QuickLogProvider()) { entry in
+            QuickLogWidgetView(entry: entry)
         }
+        .configurationDisplayName("Quick Log")
+        .description("Tap to quickly log your mood")
+        .supportedFamilies([.accessoryCircular, .accessoryInline])
     }
 }
 
-struct ComplicationCircularView: View {
+struct QuickLogEntry: TimelineEntry {
+    let date: Date
+}
+
+struct QuickLogProvider: TimelineProvider {
+    func placeholder(in context: Context) -> QuickLogEntry {
+        QuickLogEntry(date: Date())
+    }
+
+    func getSnapshot(in context: Context, completion: @escaping (QuickLogEntry) -> ()) {
+        completion(QuickLogEntry(date: Date()))
+    }
+
+    func getTimeline(in context: Context, completion: @escaping (Timeline<QuickLogEntry>) -> ()) {
+        let entry = QuickLogEntry(date: Date())
+        let timeline = Timeline(entries: [entry], policy: .never)
+        completion(timeline)
+    }
+}
+
+struct QuickLogWidgetView: View {
+    let entry: QuickLogEntry
+
     var body: some View {
         ZStack {
-            Circle()
-                .fill(.blue.opacity(0.3))
+            AccessoryWidgetBackground()
             Image(systemName: "plus.circle.fill")
                 .font(.title2)
+                .widgetAccentable()
         }
     }
 }
@@ -895,19 +906,24 @@ struct NewEntryView: View {
         }
         
         if entryType == .mood {
-            data.metric = Metric(name: "mood", value: moodValue)
+            data.metric = Metric(
+                name: "mood",
+                value: moodValue,
+                scaleMin: 1,
+                scaleMax: 10
+            )
         }
         
         let entry = LogEntryModel(
             id: UUID(),
             timestamp: Date(),
             recordedAt: Date(),
-            source: deviceSource,
-            deviceId: deviceIdentifier,
+            source: DeviceInfo.source,
+            deviceId: DeviceInfo.identifier,
             category: entryType.rawValue.lowercased(),
             data: data
         )
-        
+
         modelContext.insert(entry)
         dismiss()
     }
@@ -976,23 +992,120 @@ Create shortcuts that:
 
 ### Phase 1: Foundation (MVP)
 
-**Goal:** Basic logging from iPhone, syncing to Val Town
+**Goal:** Complete end-to-end flow: Watch → iPhone → Val Town → Timeline
 
-- [ ] Set up Val Town backend
-  - [ ] SQLite schema
-  - [ ] POST /api/entries endpoint
-  - [ ] GET /api/entries endpoint
-  - [ ] API key auth
-  - [ ] Basic HTML dashboard (list recent entries)
-- [ ] Create Xcode project with LifeLogKit package
-  - [ ] LogEntry model + SwiftData schema
-  - [ ] APIClient
-  - [ ] Basic SyncManager
-- [ ] iPhone app
-  - [ ] Timeline view (list entries)
-  - [ ] New entry form (mood, note types)
-  - [ ] Settings (API URL, key)
-  - [ ] Background sync
+**Estimated scope:** True MVP with Watch, iPhone, and backend
+
+#### Backend (Val Town)
+- [ ] Set up Val Town project
+  - [ ] Create new Val
+  - [ ] Set up SQLite schema (simplified MVP version)
+  - [ ] Configure environment variable for API key
+- [ ] Implement API endpoints
+  - [ ] POST /api/entries (create, with batch support)
+  - [ ] GET /api/entries (list with basic filters)
+  - [ ] GET /api/entries/:id (single entry)
+  - [ ] Auth middleware (bearer token)
+- [ ] Testing
+  - [ ] Test script for endpoints
+  - [ ] Verify CORS configuration
+  - [ ] Test with curl/Postman
+
+#### LifeLogKit (Shared Swift Package)
+- [ ] Project setup
+  - [ ] Create Swift Package with proper structure
+  - [ ] Set up unit test target
+  - [ ] Configure for iOS 17+ and watchOS 10+
+- [ ] Models layer
+  - [ ] LogEntry (API model - Codable struct)
+  - [ ] LogData, Metric, Location (API models)
+  - [ ] LogEntryModel (SwiftData @Model class)
+  - [ ] Conversion extensions (LogEntry ↔ LogEntryModel)
+  - [ ] Unit tests (100% coverage for encoding/decoding)
+- [ ] Utilities
+  - [ ] DeviceInfo (source + identifier)
+  - [ ] ISO8601 date formatters
+  - [ ] KeychainHelper
+  - [ ] AppGroup constants
+- [ ] API Client
+  - [ ] APIClient actor
+  - [ ] createEntries (POST)
+  - [ ] fetchEntries (GET)
+  - [ ] Error handling (LifeLogError enum)
+  - [ ] Unit tests with mocked URLSession
+- [ ] Persistence
+  - [ ] PersistenceController (SwiftData container)
+  - [ ] App Group configuration
+  - [ ] Schema migration support
+- [ ] Sync
+  - [ ] SyncManager (@Observable class)
+  - [ ] syncUnsyncedEntries logic
+  - [ ] Background sync scheduling (BGTaskScheduler)
+  - [ ] Unit tests with mocked API
+
+#### iPhone App
+- [ ] Project setup
+  - [ ] Create Xcode project (iOS + watchOS targets)
+  - [ ] Add LifeLogKit package dependency
+  - [ ] Configure App Group entitlements
+  - [ ] Set up SwiftData container
+- [ ] Settings & Onboarding
+  - [ ] SettingsView (API URL, API key input)
+  - [ ] First launch flow
+  - [ ] Keychain storage for API key
+- [ ] Timeline
+  - [ ] TimelineView (list entries, grouped by day)
+  - [ ] EntryRow component
+  - [ ] Pull to refresh → sync
+  - [ ] Category filter menu
+- [ ] New Entry
+  - [ ] NewEntryView (mood slider + optional note)
+  - [ ] Save to SwiftData
+  - [ ] Trigger immediate sync
+  - [ ] Success feedback
+- [ ] App lifecycle
+  - [ ] BGTaskScheduler registration
+  - [ ] Sync on launch
+  - [ ] Watch Connectivity session setup
+- [ ] Watch Connectivity (iPhone side)
+  - [ ] Receive entries from Watch
+  - [ ] Save to SwiftData
+  - [ ] Trigger sync
+
+#### Watch App
+- [ ] Project setup
+  - [ ] Configure watchOS target
+  - [ ] Add LifeLogKit dependency
+  - [ ] Share App Group with iPhone
+- [ ] Quick Log
+  - [ ] QuickLogView (mood slider)
+  - [ ] Save to local SwiftData
+  - [ ] Send to iPhone via Watch Connectivity
+  - [ ] Haptic feedback on save
+- [ ] Widget/Complication
+  - [ ] WidgetKit extension target
+  - [ ] AccessoryCircular widget
+  - [ ] Deep link to QuickLogView
+- [ ] Watch Connectivity (Watch side)
+  - [ ] WCSession setup
+  - [ ] Send message when reachable
+  - [ ] Application context for offline
+
+#### Testing & Polish
+- [ ] End-to-end testing
+  - [ ] Watch log → appears on iPhone → syncs to API
+  - [ ] iPhone log → syncs to API
+  - [ ] Offline queue → sync when online
+  - [ ] Fetch from API → populates timeline
+- [ ] UI polish
+  - [ ] Loading states
+  - [ ] Error alerts
+  - [ ] Empty states
+  - [ ] Accessibility labels
+- [ ] Documentation
+  - [ ] README with setup instructions
+  - [ ] API documentation
+  - [ ] Code comments for complex logic
 
 ### Phase 2: Watch + Location
 
@@ -1068,6 +1181,395 @@ Store in Keychain:
 
 -----
 
+## Technical Decisions
+
+### MVP Scope
+
+**True MVP Definition:** The minimal version that demonstrates the complete flow:
+- Watch app → log mood → sync through iPhone → Val Town backend → view in timeline
+
+**Included in MVP:**
+- Val Town backend with SQLite (POST/GET entries, simple auth)
+- iPhone app (timeline view, basic new entry form, settings)
+- Watch app (quick mood log with complication)
+- Watch Connectivity for sync relay
+- SwiftData local persistence with sync queue
+
+**Explicitly Excluded from MVP:**
+- Web dashboard (API only for now)
+- iPad/Mac apps (use iPhone app via Catalyst if needed)
+- Drafts/Shortcuts integrations
+- Background location tracking
+- Image attachments
+- Export functionality
+- Charts/analytics
+- Multiple metric types (mood only for MVP)
+
+### Data Model Decisions
+
+#### 1. Metric Scale Representation
+
+**Decision:** Use `scale_min` and `scale_max` in JSON for compatibility
+
+```swift
+// Swift
+struct Metric: Codable {
+    let name: String
+    let value: Double
+    var unit: String?
+    var scaleMin: Double?
+    var scaleMax: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case name, value, unit
+        case scaleMin = "scale_min"
+        case scaleMax = "scale_max"
+    }
+}
+```
+
+**Rationale:** JSON doesn't have a native range type. Min/max is universal and works across all platforms.
+
+#### 2. Extensible Data Field
+
+**Decision:** Skip the `extra` field in MVP, add when needed
+
+```swift
+// MVP version - simplified
+struct LogData: Codable {
+    var text: String?
+    var metric: Metric?
+    var location: Location?
+    var tags: [String]?
+    // Skip imageURL and extra for MVP
+}
+```
+
+**Rationale:**
+- AnyCodable adds complexity (requires third-party package or custom implementation)
+- MVP doesn't need extensibility yet
+- Can add later as `[String: String]` or proper AnyCodable when requirements are clear
+
+#### 3. Watch Energy + Mood Handling
+
+**Decision:** Single entry with mood metric, store energy in text note
+
+```swift
+// QuickLogView creates one entry:
+let entry = LogEntryModel(
+    category: "mood",
+    data: LogData(
+        text: "Energy: \(Int(energyValue))",  // Simple approach for MVP
+        metric: Metric(name: "mood", value: moodValue, scaleMin: 1, scaleMax: 10)
+    )
+)
+```
+
+**Post-MVP:** Add support for multiple metrics per entry when needed.
+
+### Swift Architecture
+
+#### 4. Model Layer Separation
+
+**Decision:** Two-layer model architecture
+
+```
+┌─────────────────────────────────────────────────┐
+│ LogEntry (struct, Codable)                      │
+│ - API transfer object                           │
+│ - Immutable, value semantics                    │
+│ - JSON encoding/decoding                        │
+└─────────────────────────────────────────────────┘
+                    ↕
+         Conversion Methods
+                    ↕
+┌─────────────────────────────────────────────────┐
+│ LogEntryModel (class, @Model)                   │
+│ - SwiftData persistence                         │
+│ - Mutable, reference semantics                  │
+│ - Includes synced flag                          │
+└─────────────────────────────────────────────────┘
+```
+
+**Rationale:**
+- Separation of concerns: API vs persistence
+- SwiftData models need reference semantics (@Model requires class)
+- API models benefit from value semantics (struct)
+- Clear conversion boundary
+
+#### 5. Device Identification
+
+**Decision:** Create `DeviceInfo` utility
+
+```swift
+enum DeviceInfo {
+    static var source: String {
+        #if os(watchOS)
+        return "watch"
+        #elseif os(macOS)
+        return "mac"
+        #else
+        return UIDevice.current.userInterfaceIdiom == .pad ? "ipad" : "iphone"
+        #endif
+    }
+
+    static var identifier: String {
+        #if os(watchOS)
+        return WKInterfaceDevice.current().identifierForVendor?.uuidString ?? "unknown-watch"
+        #elseif os(macOS)
+        // Use IOPlatformUUID or generate stable ID
+        return "mac-\(UUID())"  // TODO: Make stable across launches
+        #else
+        return UIDevice.current.identifierForVendor?.uuidString ?? "unknown-ios"
+        #endif
+    }
+}
+```
+
+### Backend Decisions
+
+#### 6. Val Town Framework & Implementation
+
+**Decision:** Use Hono framework with Val Town's SQLite
+
+**Rationale:**
+- Hono is lightweight, fast, and well-supported on Val Town
+- Built-in middleware (CORS, auth)
+- Type-safe routing
+- Val Town's SQLite is adequate for single-user MVP
+
+**Authentication:**
+```typescript
+// Simple bearer token approach
+// Initial setup: Manually create API key via Val Town secrets
+const API_KEY = Deno.env.get("LIFELOG_API_KEY");
+
+function authMiddleware(c, next) {
+  const auth = c.req.header("Authorization");
+  if (!auth || !auth.startsWith("Bearer ")) {
+    return c.json({ error: "Unauthorized" }, 401);
+  }
+  const token = auth.substring(7);
+  if (token !== API_KEY) {
+    return c.json({ error: "Invalid token" }, 401);
+  }
+  return next();
+}
+```
+
+**For MVP:** Single API key stored in Val Town environment variable. No key generation endpoint.
+
+#### 7. Database Schema Simplification
+
+**Decision:** Defer the `api_keys` and `images` tables to post-MVP
+
+```sql
+-- MVP schema
+CREATE TABLE IF NOT EXISTS entries (
+    id TEXT PRIMARY KEY,
+    timestamp TEXT NOT NULL,
+    recorded_at TEXT NOT NULL,
+    source TEXT NOT NULL,
+    device_id TEXT NOT NULL,
+    category TEXT,
+    data TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_timestamp ON entries(timestamp DESC);
+```
+
+**Rationale:** MVP uses single API key from environment variable.
+
+### iOS/watchOS Decisions
+
+#### 8. Widgets & Complications
+
+**Decision:** Use WidgetKit for watchOS 9+ (skip legacy ClockKit)
+
+```swift
+// Use WidgetKit with AccessoryCircular family
+struct QuickLogWidget: Widget {
+    var body: some WidgetConfiguration {
+        StaticConfiguration(kind: "QuickLog", provider: Provider()) { entry in
+            QuickLogWidgetView(entry: entry)
+        }
+        .configurationDisplayName("Quick Log")
+        .supportedFamilies([.accessoryCircular])
+    }
+}
+```
+
+**Rationale:**
+- Modern API (iOS 16+, watchOS 9+)
+- Better performance
+- Unified across platforms
+- ClockKit is deprecated
+
+**Minimum deployment targets:**
+- iOS 17.0 (for latest SwiftData features)
+- watchOS 10.0 (for WidgetKit complications)
+- macOS 14.0 (post-MVP)
+
+#### 9. Background Sync Strategy
+
+**Decision:** BGTaskScheduler with URLSession background uploads
+
+```swift
+// Register background task
+BGTaskScheduler.shared.register(
+    forTaskWithIdentifier: "com.lifelog.sync",
+    using: nil
+) { task in
+    handleBackgroundSync(task: task as! BGAppRefreshTask)
+}
+
+// Schedule opportunistic sync
+func scheduleBackgroundSync() {
+    let request = BGAppRefreshTaskRequest(identifier: "com.lifelog.sync")
+    request.earliestBeginDate = Date(timeIntervalSinceNow: 15 * 60) // 15 min
+    try? BGTaskScheduler.shared.submit(request)
+}
+```
+
+**Sync frequency:**
+- Immediate when online and entry created
+- Background task: every 15-60 minutes when app is backgrounded
+- On app launch: sync if last sync > 5 minutes ago
+
+**Rationale:**
+- BGTaskScheduler is the modern approach (iOS 13+)
+- System manages scheduling based on device conditions
+- Respects battery and network constraints
+
+#### 10. Watch Connectivity Implementation
+
+**Decision:** Use WCSession with application context for offline queue
+
+**Strategy:**
+1. Watch creates entry → saves to local SwiftData
+2. If iPhone is reachable → send via `sendMessage` (immediate)
+3. If iPhone not reachable → update `applicationContext` (when possible)
+4. iPhone receives → saves to its SwiftData → syncs to API
+
+**Rationale:**
+- `sendMessage`: Fast, real-time when connected
+- `applicationContext`: Guaranteed eventual delivery
+- Fallback ensures no data loss
+
+### Testing Strategy
+
+#### 11. Test Coverage Approach
+
+**Decision:** Red-Green-Refactor with pragmatic coverage
+
+**Coverage targets:**
+- Models (encoding/decoding): 100%
+- API client: 80%+ (mock URLSession)
+- Sync logic: 80%+ (mock API)
+- UI: Smoke tests only for MVP (test key user paths exist)
+
+**Test structure:**
+```
+Tests/
+├── LifeLogKitTests/
+│   ├── Models/
+│   │   ├── LogEntryTests.swift
+│   │   └── MetricTests.swift
+│   ├── API/
+│   │   └── APIClientTests.swift
+│   └── Sync/
+│       └── SyncManagerTests.swift
+└── LifeLogUITests/
+    └── SmokeTests.swift
+```
+
+**TDD workflow per feature:**
+1. Write failing test → commit "test: add test for X"
+2. Implement → commit "feat: implement X"
+3. Refactor → commit "refactor: improve X"
+
+### Deployment & Configuration
+
+#### 12. Val Town Deployment
+
+**Decision:** Single-file deployment for MVP
+
+```typescript
+// val-town/lifelog-api.ts
+// Contains all backend logic in one val for simplicity
+// Can split into modules post-MVP
+```
+
+**Rationale:** Val Town works best with single-file vals for simple projects. Can refactor to imports later.
+
+#### 13. API Configuration in Apps
+
+**Decision:** Store in UserDefaults + Keychain
+
+```swift
+// UserDefaults: API base URL (not sensitive)
+UserDefaults.standard.set("https://username-lifelog.web.val.run", forKey: "apiBaseURL")
+
+// Keychain: API key (sensitive)
+KeychainHelper.save(apiKey, service: "com.lifelog.api", account: "apiKey")
+```
+
+**Shared between Watch & iPhone:**
+- Use App Group for shared UserDefaults
+- Use App Group Keychain for shared API key
+
+```swift
+// App Group ID
+let appGroupID = "group.com.lifelog.shared"
+```
+
+### Error Handling
+
+#### 14. Error Handling Pattern
+
+**Decision:** Structured errors with user-facing messages
+
+```swift
+enum LifeLogError: LocalizedError {
+    case networkUnavailable
+    case unauthorized
+    case invalidResponse
+    case syncFailed(underlying: Error)
+
+    var errorDescription: String? {
+        switch self {
+        case .networkUnavailable: return "No internet connection"
+        case .unauthorized: return "Invalid API key"
+        case .invalidResponse: return "Server error"
+        case .syncFailed(let error): return "Sync failed: \(error.localizedDescription)"
+        }
+    }
+}
+```
+
+**For MVP:** Simple error alerts. Post-MVP: toast notifications, retry logic.
+
+### Dependencies
+
+#### 15. External Dependencies
+
+**Swift Packages (all official Apple frameworks):**
+- SwiftData (persistence)
+- WatchConnectivity (watch sync)
+- CoreLocation (location)
+- WidgetKit (complications)
+
+**No third-party dependencies for MVP.**
+
+**Val Town:**
+- Hono (`npm:hono`)
+- Val Town standard library (`https://esm.town/v/std/sqlite`)
+
+**Rationale:** Minimize dependencies for MVP. Keep it simple and maintainable.
+
+-----
+
 ## Open Questions / Future Decisions
 
 1. **Image storage:** Where to put images? Val Town blob storage? Cloudflare R2? For MVP, skip images.
@@ -1080,8 +1582,18 @@ Store in Keychain:
 
 ## Resources
 
+### Backend
 - [Val Town Documentation](https://docs.val.town/)
+- [Hono Framework](https://hono.dev/)
+- [Val Town SQLite](https://docs.val.town/std/sqlite/)
+
+### Swift & iOS
 - [SwiftData Documentation](https://developer.apple.com/documentation/swiftdata)
+- [WidgetKit](https://developer.apple.com/documentation/widgetkit)
 - [Watch Connectivity](https://developer.apple.com/documentation/watchconnectivity)
-- [ClockKit Complications](https://developer.apple.com/documentation/clockkit)
+- [BGTaskScheduler](https://developer.apple.com/documentation/backgroundtasks/bgtaskscheduler)
+- [Keychain Services](https://developer.apple.com/documentation/security/keychain_services)
+
+### Integrations (Post-MVP)
 - [Drafts Scripting](https://docs.getdrafts.com/docs/actions/scripting)
+- [Shortcuts User Guide](https://support.apple.com/guide/shortcuts/)
